@@ -185,4 +185,25 @@ router.delete('/users/:id', protect, admin, async (req, res) => {
     }
 });
 
+// @desc    Manually adjust user credits (publer + snov)
+// @route   PUT /api/admin/users/:id/credits
+// @access  Private/Admin
+router.put('/users/:id/credits', protect, admin, async (req, res) => {
+    try {
+        const { publer, snov } = req.body;
+        const updated = await User.findByIdAndUpdate(
+            req.params.id,
+            {
+                ...(publer !== undefined && { 'credits.publer': Number(publer) }),
+                ...(snov   !== undefined && { 'credits.snov':   Number(snov)   }),
+            },
+            { new: true }
+        );
+        if (!updated) return res.status(404).json({ message: 'User not found' });
+        res.json(updated);
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+});
+
 export default router;

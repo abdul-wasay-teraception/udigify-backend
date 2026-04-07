@@ -3,6 +3,7 @@ import express from 'express';
 import SnovCache from '../models/SnovCache.js';
 import User from '../models/User.js';
 import { protect } from '../middleware/auth.js';
+import { PLANS as STRIPE_PLANS } from '../config/plans.js';
 
 const router = express.Router();
 const SNOV_BASE = 'https://api.snov.io';
@@ -321,9 +322,66 @@ function normalizeEmailVerificationRows(statusData, requestedEmails = []) {
 
 // ─── Helper: get user's plan + reset usage if month rolled over ───────────────
 async function getUserPlanData(userId) {
-    const user = await User.findById(userId).select('snovPlan snovUsage snovCustomLimits');
+    const user = await User.findById(userId).select('snovPlan snovUsage snovCustomLimits subscription credits');
     if (!user) throw new Error('User not found');
 
+    // ─── Prefer new Stripe subscription credits ───────────────────────────────
+    const subPlan   = user.subscription?.plan;
+    const subStatus = user.subscription?.status;
+    const hasActiveSub = subStatus === 'active' || subStatus === 'trialing';
+
+    if (hasActiveSub && subPlan && STRIPE_PLANS[subPlan]) {
+        const stripePlan = STRIPE_PLANS[subPlan];
+        const snovCredits = user.credits?.snov ?? 0;
+
+        // Auto-reset credits if past reset date
+        const now = new Date();
+        if (user.credits?.resetDate && now >= new Date(user.credits.resetDate)) {
+            const nextReset = new Date(user.subscription?.currentPeriodEnd || now);
+            await User.findByIdAndUpdate(userId, {
+                'credits.snov':      stripePlan.snovCredits,
+                'credits.publer':    stripePlan.publerCredits,
+                'credits.resetDate': nextReset,
+            });
+            return {
+                user,
+                plan:   subPlan,
+                limits: {
+                    leadsPerMonth:      stripePlan.snovCredits,
+                    emailFindsPerMonth: stripePlan.snovCredits,
+                    bulkExport:         subPlan === 'agency',
+                    advancedFilters:    subPlan !== 'starter',
+                },
+                usage: {
+                    leadsThisMonth:      0,
+                    emailFindsThisMonth: 0,
+                    resetDate:           nextReset,
+                },
+            };
+        }
+
+        // leadsThisMonth = initial credits − remaining credits
+        const initialCredits = stripePlan.snovCredits;
+        const leadsUsed = Math.max(0, initialCredits - snovCredits);
+
+        return {
+            user,
+            plan:   subPlan,
+            limits: {
+                leadsPerMonth:      initialCredits,
+                emailFindsPerMonth: initialCredits,
+                bulkExport:         subPlan === 'agency',
+                advancedFilters:    subPlan !== 'starter',
+            },
+            usage: {
+                leadsThisMonth:      leadsUsed,
+                emailFindsThisMonth: leadsUsed,
+                resetDate:           user.credits?.resetDate || user.subscription?.currentPeriodEnd,
+            },
+        };
+    }
+
+    // ─── Fall back to legacy snovPlan system ─────────────────────────────────
     const now = new Date();
     if (user.snovUsage?.resetDate && now >= new Date(user.snovUsage.resetDate)) {
         const nextReset = new Date(now);
@@ -336,7 +394,6 @@ async function getUserPlanData(userId) {
     const plan = user.snovPlan || 'none';
     const planLimits = PLAN_LIMITS[plan] || PLAN_LIMITS.none;
 
-    // Custom per-user limits override plan defaults when enabled
     let limits;
     if (user.snovCustomLimits?.enabled) {
         limits = {
@@ -360,16 +417,36 @@ async function getUserPlanData(userId) {
 
 // ─── Helper: increment lead search usage ────────────────────────────────────
 async function incrementUsage(userId, count = 1) {
-    await User.findByIdAndUpdate(userId, {
-        $inc: { 'snovUsage.leadsThisMonth': count },
-    });
+    const user = await User.findById(userId).select('subscription credits');
+    const hasActiveSub = user?.subscription?.status === 'active' || user?.subscription?.status === 'trialing';
+
+    if (hasActiveSub && user?.credits?.snov !== undefined) {
+        // Stripe-based: deduct from credits
+        await User.findByIdAndUpdate(userId, {
+            $inc: { 'credits.snov': -count },
+        });
+    } else {
+        // Legacy: increment usage counter
+        await User.findByIdAndUpdate(userId, {
+            $inc: { 'snovUsage.leadsThisMonth': count },
+        });
+    }
 }
 
 // ─── Helper: increment email find usage ──────────────────────────────────────
 async function incrementEmailUsage(userId, count = 1) {
-    await User.findByIdAndUpdate(userId, {
-        $inc: { 'snovUsage.emailFindsThisMonth': count },
-    });
+    const user = await User.findById(userId).select('subscription credits');
+    const hasActiveSub = user?.subscription?.status === 'active' || user?.subscription?.status === 'trialing';
+
+    if (hasActiveSub && user?.credits?.snov !== undefined) {
+        await User.findByIdAndUpdate(userId, {
+            $inc: { 'credits.snov': -count },
+        });
+    } else {
+        await User.findByIdAndUpdate(userId, {
+            $inc: { 'snovUsage.emailFindsThisMonth': count },
+        });
+    }
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
@@ -406,7 +483,10 @@ router.post('/people/search', protect, async (req, res) => {
         const { plan, limits, usage } = await getUserPlanData(req.user._id);
 
         if (plan === 'none') {
-            return res.status(403).json({ message: 'Lead generation plan not configured. Contact your admin.' });
+            return res.status(403).json({
+                message: 'An active subscription is required for lead generation. Visit the Pricing page to get started.',
+                upgradeRequired: true,
+            });
         }
 
         const {
@@ -475,137 +555,81 @@ router.post('/people/search', protect, async (req, res) => {
             });
         }
 
-        // Build Snov.io prospector payload
-        const payload = { limit: safePerPage, page };
-        if (q_keywords) payload.companyName = keywordCandidates.length ? keywordCandidates : [q_keywords];
-        if (person_titles?.length) payload.jobTitle = person_titles;
-        if (person_seniorities?.length) payload.seniorityLevel = person_seniorities;
-        if (organization_industries?.length) payload.industry = organization_industries;
-        if (organization_num_employees_ranges?.length) payload.companySize = organization_num_employees_ranges;
-        if (normalizedLocations.length) payload.locations = normalizedLocations;
+        // Snov.io v2 API: company-domain-by-name → domain-search/prospects
+        // (v1/prospector was removed from the latest Snov.io API)
+        const nameCandidates = keywordCandidates;
 
-        let data;
-        try {
-            data = await snovFetch('/v1/prospector', {
-                method: 'POST',
-                body: JSON.stringify(payload),
-            });
-        } catch (err) {
-            // Snov deprecated the old prospector endpoint for some accounts.
-            if (!String(err.message || '').includes('404')) throw err;
-
-            const nameCandidates = keywordCandidates;
-
-            if (nameCandidates.length === 0) {
-                return res.status(400).json({
-                    message: 'People Search currently requires keyword company names (comma-separated) due Snov API changes.',
-                });
-            }
-
-            const domainStart = await snovFetch('/v2/company-domain-by-name/start', {
-                method: 'POST',
-                body: JSON.stringify({ names: nameCandidates }),
-            });
-
-            const domainTaskHash = domainStart?.data?.task_hash;
-            const domainResultUrl = domainTaskHash ? `${SNOV_BASE}/v2/company-domain-by-name/result?task_hash=${domainTaskHash}` : null;
-            const domainResult = domainResultUrl ? await pollSnovResult(domainResultUrl) : { data: [] };
-
-            const domains = Array.from(new Set((domainResult?.data || [])
-                .map(item => item?.result?.domain)
-                .filter(Boolean)))
-                .slice(0, 3);
-
-            if (domains.length === 0) {
-                const emptyResponse = {
-                    people: [],
-                    pagination: { total_entries: 0, total_pages: 0, current_page: page },
-                };
-                await setCachedSnovData(req.user._id, 'peopleSearch', peopleSearchCacheInput, emptyResponse);
-                return res.json({ ...emptyResponse, usage, limits });
-            }
-
-            const prospects = [];
-            for (const domain of domains) {
-                const start = await snovFetch('/v2/domain-search/prospects/start', {
-                    method: 'POST',
-                    body: JSON.stringify({
-                        domain,
-                        page,
-                        positions: person_titles?.length ? person_titles.slice(0, 10) : undefined,
-                    }),
-                });
-                const resultUrl = start?.links?.result;
-                if (!resultUrl) continue;
-                const result = await pollSnovResult(resultUrl);
-                prospects.push(...(result?.data || []).map(p => ({ ...p, __domain: domain })));
-            }
-
-            const locationNeedles = normalizedLocations.map(v => String(v).toLowerCase());
-            const filteredProspects = prospects.filter((p) => {
-                if (!locationNeedles.length) return true;
-                const hay = String(p.location || p.country || '').toLowerCase();
-                // v2 prospects can omit location fields; keep these records instead of dropping all results.
-                if (!hay) return true;
-                return locationNeedles.some(n => hay.includes(n));
-            }).slice(0, safePerPage);
-
-            const people = filteredProspects.map(p => ({
-                id: p.id || `${p.first_name || p.firstName || ''}-${p.last_name || p.lastName || ''}-${p.__domain || ''}`,
-                name: p.name || `${p.first_name || p.firstName || ''} ${p.last_name || p.lastName || ''}`.trim(),
-                first_name: p.first_name || p.firstName,
-                last_name: p.last_name || p.lastName,
-                title: p.position || p.title || null,
-                organization_name: p.company || p.company_name || p.__domain || null,
-                organization: {
-                    name: p.company || p.company_name || p.__domain || null,
-                    website_url: p.__domain ? `https://${p.__domain}` : null,
-                    industry: p.industry || null,
-                },
-                city: null,
-                state: null,
-                country: p.country || p.location || null,
-                seniority: p.seniority || null,
-                email_status: null,
-                linkedin_url: p.source_page || p.linkedin_url || null,
-                photo_url: null,
-            }));
-
-            const returnedCount = people.length;
-            if (returnedCount > 0) await incrementUsage(req.user._id, returnedCount);
-
-            const responsePayload = {
-                people,
-                pagination: {
-                    total_entries: people.length,
-                    total_pages: Math.ceil(people.length / safePerPage),
-                    current_page: page,
-                },
-            };
-            await setCachedSnovData(req.user._id, 'peopleSearch', peopleSearchCacheInput, responsePayload);
-
-            return res.json({
-                ...responsePayload,
-                usage: { ...usage, leadsThisMonth: usage.leadsThisMonth + returnedCount },
-                limits,
+        if (nameCandidates.length === 0) {
+            return res.status(400).json({
+                message: 'People Search requires keyword company names (comma-separated).',
             });
         }
 
-        // Normalise Snov.io response to match the frontend's expected shape
-        const people = (data.data || []).map(p => ({
-            id: p.id || `${p.firstName}-${p.lastName}-${p.company}`,
-            name: p.name || `${p.firstName || ''} ${p.lastName || ''}`.trim(),
-            first_name: p.firstName,
-            last_name: p.lastName,
-            title: p.position,
-            organization_name: p.company,
-            organization: { name: p.company, website_url: p.companyWebsite, industry: p.industry },
+        const domainStart = await snovFetch('/v2/company-domain-by-name/start', {
+            method: 'POST',
+            body: JSON.stringify({ names: nameCandidates }),
+        });
+
+        const domainTaskHash = domainStart?.data?.task_hash;
+        const domainResultUrl = domainTaskHash ? `${SNOV_BASE}/v2/company-domain-by-name/result?task_hash=${domainTaskHash}` : null;
+        const domainResult = domainResultUrl ? await pollSnovResult(domainResultUrl) : { data: [] };
+
+        const domains = Array.from(new Set((domainResult?.data || [])
+            .map(item => item?.result?.domain)
+            .filter(Boolean)))
+            .slice(0, 3);
+
+        if (domains.length === 0) {
+            const emptyResponse = {
+                people: [],
+                pagination: { total_entries: 0, total_pages: 0, current_page: page },
+            };
+            await setCachedSnovData(req.user._id, 'peopleSearch', peopleSearchCacheInput, emptyResponse);
+            return res.json({ ...emptyResponse, usage, limits });
+        }
+
+        const prospects = [];
+        for (const domain of domains) {
+            const start = await snovFetch('/v2/domain-search/prospects/start', {
+                method: 'POST',
+                body: JSON.stringify({
+                    domain,
+                    page,
+                    positions: person_titles?.length ? person_titles.slice(0, 10) : undefined,
+                }),
+            });
+            const resultUrl = start?.links?.result;
+            if (!resultUrl) continue;
+            const result = await pollSnovResult(resultUrl);
+            prospects.push(...(result?.data || []).map(p => ({ ...p, __domain: domain })));
+        }
+
+        const locationNeedles = normalizedLocations.map(v => String(v).toLowerCase());
+        const filteredProspects = prospects.filter((p) => {
+            if (!locationNeedles.length) return true;
+            const hay = String(p.location || p.country || '').toLowerCase();
+            if (!hay) return true;
+            return locationNeedles.some(n => hay.includes(n));
+        }).slice(0, safePerPage);
+
+        const people = filteredProspects.map(p => ({
+            id: p.id || `${p.first_name || p.firstName || ''}-${p.last_name || p.lastName || ''}-${p.__domain || ''}`,
+            name: p.name || `${p.first_name || p.firstName || ''} ${p.last_name || p.lastName || ''}`.trim(),
+            first_name: p.first_name || p.firstName,
+            last_name: p.last_name || p.lastName,
+            title: p.position || p.title || null,
+            organization_name: p.company || p.company_name || p.__domain || null,
+            organization: {
+                name: p.company || p.company_name || p.__domain || null,
+                website_url: p.__domain ? `https://${p.__domain}` : null,
+                industry: p.industry || null,
+            },
             city: null,
             state: null,
-            country: p.location || null,
-            seniority: p.seniority,
+            country: p.country || p.location || null,
+            seniority: p.seniority || null,
             email_status: null,
-            linkedin_url: p.socialLinks?.linkedin || null,
+            linkedin_url: p.source_page || p.linkedin_url || null,
             photo_url: null,
         }));
 
@@ -615,8 +639,8 @@ router.post('/people/search', protect, async (req, res) => {
         const responsePayload = {
             people,
             pagination: {
-                total_entries: data.totalRecords || returnedCount,
-                total_pages: Math.ceil((data.totalRecords || returnedCount) / safePerPage),
+                total_entries: people.length,
+                total_pages: Math.ceil(people.length / safePerPage),
                 current_page: page,
             },
         };
@@ -1246,11 +1270,8 @@ router.post('/tech/check', protect, async (req, res) => {
 
         let data;
         try {
-            // Snov expects the bare domain (e.g. "hubspot.com"), NOT a full https:// URL
-            data = await snovFetch('/v1/technology-checker', {
-                method: 'POST',
-                body: JSON.stringify({ url: domain }),
-            });
+            // v1 endpoint uses form-encoded body; bare domain only (e.g. "hubspot.com")
+            data = await snovFetchForm('/v1/technology-checker', { url: domain });
         } catch (snovErr) {
             const msg = snovErr.message || '';
             // Snov returns 404 when they have no crawl data for the domain — treat as empty result

@@ -228,6 +228,25 @@ router.get('/posts', protect, async (req, res) => {
 // @access Private
 router.post('/posts', protect, async (req, res) => {
     try {
+        // ─── Credit check ─────────────────────────────────────────────────────
+        const userDoc = await User.findById(req.user._id).select('subscription credits');
+        const subStatus = userDoc?.subscription?.status;
+        const publerCredits = userDoc?.credits?.publer ?? 0;
+
+        if (subStatus !== 'active' && subStatus !== 'trialing') {
+            return res.status(403).json({
+                message: 'An active subscription is required to post. Visit the Pricing page to get started.',
+                upgradeRequired: true,
+            });
+        }
+        if (publerCredits <= 0) {
+            return res.status(429).json({
+                message: `You have used all your Publer post credits for this billing period. Upgrade your plan for more posts.`,
+                upgradeRequired: true,
+                credits: { publer: 0 },
+            });
+        }
+
         const workspaceId = await getWorkspaceId(req.user._id);
         if (!workspaceId) {
             return res.status(400).json({ message: 'Your Publer workspace has not been configured yet. Contact your admin.' });
@@ -271,6 +290,11 @@ router.post('/posts', protect, async (req, res) => {
             method: 'POST',
             body: JSON.stringify(payload),
         }, workspaceId);
+
+        // ─── Deduct 1 Publer credit on success ────────────────────────────────
+        await User.findByIdAndUpdate(req.user._id, {
+            $inc: { 'credits.publer': -1 },
+        });
 
         // Publer returns { success: true, data: { job_id: "..." } } — normalise for frontend
         res.json({ job_id: result?.data?.job_id || result?.job_id || null, raw: result });

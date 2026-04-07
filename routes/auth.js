@@ -89,7 +89,11 @@ router.post('/login', async (req, res) => {
                 role: user.role,
                 accessGiven: user.accessGiven,
                 publerPlan: user.publerPlan || 'none',
+                publerCreds: user.publerCreds,
                 publerWorkspaceId: user.publerCreds?.workspaceId || '',
+                snovPlan: user.snovPlan || 'none',
+                subscription: user.subscription || {},
+                credits: user.credits || { publer: 0, snov: 0 },
                 token: generateToken(user._id),
             });
         } else {
@@ -197,7 +201,12 @@ router.get('/me', protect, async (req, res) => {
                 role: user.role,
                 accessGiven: user.accessGiven,
                 systemeCreds: user.systemeCreds,
-                token: req.token // Keep the token
+                publerPlan: user.publerPlan || 'none',
+                publerCreds: user.publerCreds,
+                snovPlan: user.snovPlan || 'none',
+                subscription: user.subscription || {},
+                credits: user.credits || { publer: 0, snov: 0 },
+                token: req.headers.authorization?.split(' ')[1],
             });
         } else {
             res.status(404).json({ message: 'User not found' });

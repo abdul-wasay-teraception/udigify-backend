@@ -70,6 +70,21 @@ const userSchema = new mongoose.Schema({
         leadsPerMonth:      { type: Number,  default: 0 },
         emailFindsPerMonth: { type: Number,  default: 0 },
     },
+    // ─── Stripe Subscription ─────────────────────────────────────────────────
+    subscription: {
+        plan:                 { type: String, enum: ['none', 'starter', 'growth', 'agency'], default: 'none' },
+        stripeCustomerId:     { type: String, default: null },
+        stripeSubscriptionId: { type: String, default: null },
+        stripePriceId:        { type: String, default: null },
+        status:               { type: String, enum: ['active', 'trialing', 'past_due', 'canceled', 'incomplete', 'inactive'], default: 'inactive' },
+        currentPeriodEnd:     { type: Date,   default: null },
+    },
+    // ─── Per-service monthly credits (reset on subscription renewal) ──────────
+    credits: {
+        publer:    { type: Number, default: 0 },
+        snov:      { type: Number, default: 0 },
+        resetDate: { type: Date,   default: null },
+    },
     createdAt: {
         type: Date,
         default: Date.now,
