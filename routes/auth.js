@@ -8,6 +8,49 @@ import { protect } from '../middleware/auth.js';
 
 const router = express.Router();
 
+function buildUserPayload(user, token) {
+    return {
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        accessGiven: user.accessGiven,
+        publerPlan: user.publerPlan || 'none',
+        publerCreds: user.publerCreds,
+        publerWorkspaceId: user.publerCreds?.workspaceId || '',
+        snovPlan: user.snovPlan || 'none',
+        agencyAnalyticsPlan: user.agencyAnalyticsPlan || 'none',
+        agencyAnalyticsCreds: user.agencyAnalyticsCreds,
+        agencyAnalyticsRequest: user.agencyAnalyticsRequest,
+        agencyAnalyticsConfigured: Boolean(user.agencyAnalyticsCreds?.agencyUserId),
+        subscription: user.subscription || {},
+        credits: user.credits || { publer: 0, snov: 0 },
+        token,
+    };
+}
+
+function normalizeWebsiteUrl(input) {
+    const raw = String(input || '').trim();
+    if (!raw) {
+        throw new Error('Website URL is required');
+    }
+
+    const prefixed = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`;
+    let parsed;
+    try {
+        parsed = new URL(prefixed);
+    } catch {
+        throw new Error('Please enter a valid website URL');
+    }
+
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+        throw new Error('Please enter a valid website URL');
+    }
+
+    parsed.hash = '';
+    return parsed.toString();
+}
+
 // Generate JWT
 const generateToken = (id) => {
     return jwt.sign({ id }, process.env.JWT_SECRET, {
@@ -56,14 +99,7 @@ router.post('/register', async (req, res) => {
         });
 
         if (user) {
-            res.status(201).json({
-                _id: user._id,
-                name: user.name,
-                email: user.email,
-                role: user.role,
-                accessGiven: user.accessGiven,
-                token: generateToken(user._id),
-            });
+            res.status(201).json(buildUserPayload(user, generateToken(user._id)));
         } else {
             res.status(400).json({ message: 'Invalid user data' });
         }
@@ -82,20 +118,7 @@ router.post('/login', async (req, res) => {
         const user = await User.findOne({ email });
 
         if (user && (await bcrypt.compare(password, user.password))) {
-            res.json({
-                _id: user._id,
-                name: user.name,
-                email: user.email,
-                role: user.role,
-                accessGiven: user.accessGiven,
-                publerPlan: user.publerPlan || 'none',
-                publerCreds: user.publerCreds,
-                publerWorkspaceId: user.publerCreds?.workspaceId || '',
-                snovPlan: user.snovPlan || 'none',
-                subscription: user.subscription || {},
-                credits: user.credits || { publer: 0, snov: 0 },
-                token: generateToken(user._id),
-            });
+            res.json(buildUserPayload(user, generateToken(user._id)));
         } else {
             res.status(401).json({ message: 'Invalid email or password' });
         }
@@ -194,25 +217,43 @@ router.get('/me', protect, async (req, res) => {
     try {
         const user = await User.findById(req.user._id);
         if (user) {
-            res.json({
-                _id: user._id,
-                name: user.name,
-                email: user.email,
-                role: user.role,
-                accessGiven: user.accessGiven,
-                systemeCreds: user.systemeCreds,
-                publerPlan: user.publerPlan || 'none',
-                publerCreds: user.publerCreds,
-                snovPlan: user.snovPlan || 'none',
-                subscription: user.subscription || {},
-                credits: user.credits || { publer: 0, snov: 0 },
-                token: req.headers.authorization?.split(' ')[1],
-            });
+            res.json(buildUserPayload(user, req.headers.authorization?.split(' ')[1]));
         } else {
             res.status(404).json({ message: 'User not found' });
         }
     } catch (error) {
         res.status(500).json({ message: error.message });
+    }
+});
+
+// @desc    Save AgencyAnalytics website request for current user
+// @route   PUT /api/auth/me/agencyanalytics-request
+// @access  Private
+router.put('/me/agencyanalytics-request', protect, async (req, res) => {
+    try {
+        const user = await User.findById(req.user._id);
+        if (!user) {
+            return res.status(404).json({ message: 'User not found' });
+        }
+
+        const websiteUrl = normalizeWebsiteUrl(req.body.websiteUrl);
+        const now = new Date();
+        const hasCampaignMapping = Boolean(String(user.agencyAnalyticsCreds?.campaignId || '').trim());
+
+        user.agencyAnalyticsRequest = {
+            ...(user.agencyAnalyticsRequest || {}),
+            websiteUrl,
+            status: hasCampaignMapping ? 'assigned' : 'pending',
+            submittedAt: now,
+            updatedAt: now,
+        };
+        user.markModified('agencyAnalyticsRequest');
+
+        const updated = await user.save();
+        return res.json(buildUserPayload(updated, req.headers.authorization?.split(' ')[1]));
+    } catch (error) {
+        const statusCode = error.message === 'User not found' ? 404 : 400;
+        return res.status(statusCode).json({ message: error.message || 'Failed to save website request' });
     }
 });
 

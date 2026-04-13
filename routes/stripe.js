@@ -426,23 +426,26 @@ async function handleStripeEvent(event) {
                 publerPlan:          planId,
             }, { new: true });
 
-            // Log payment record
-            await PaymentHistory.create({
-                user:                updatedUser._id,
-                userName:            updatedUser.name,
-                userEmail:           updatedUser.email,
-                plan:                planId,
-                planName:            plan.name,
-                amount:              plan.stripePriceCents,
-                currency:            'usd',
-                status:              'succeeded',
-                type:                'new_subscription',
-                stripeSessionId:     session.id,
-                stripeSubscriptionId: subId,
-                periodStart,
-                periodEnd,
-                paidAt:              new Date(),
-            });
+            // Log payment record (idempotent — skip if already logged by sync-session)
+            const existingPayment = await PaymentHistory.findOne({ stripeSessionId: session.id });
+            if (!existingPayment) {
+                await PaymentHistory.create({
+                    user:                updatedUser._id,
+                    userName:            updatedUser.name,
+                    userEmail:           updatedUser.email,
+                    plan:                planId,
+                    planName:            plan.name,
+                    amount:              plan.stripePriceCents,
+                    currency:            'usd',
+                    status:              'succeeded',
+                    type:                'new_subscription',
+                    stripeSessionId:     session.id,
+                    stripeSubscriptionId: subId,
+                    periodStart,
+                    periodEnd,
+                    paidAt:              new Date(),
+                });
+            }
 
             console.log(`[Stripe] Provisioned ${planId} plan for user ${userId} — access auto-granted`);
             break;

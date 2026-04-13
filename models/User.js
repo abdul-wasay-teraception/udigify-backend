@@ -1,5 +1,12 @@
 import mongoose from 'mongoose';
 
+function nextMonthResetDate() {
+    const date = new Date();
+    date.setDate(1);
+    date.setMonth(date.getMonth() + 1);
+    return date;
+}
+
 const userSchema = new mongoose.Schema({
     name: {
         type: String,
@@ -60,15 +67,43 @@ const userSchema = new mongoose.Schema({
     snovUsage: {
         leadsThisMonth:      { type: Number, default: 0 },
         emailFindsThisMonth: { type: Number, default: 0 },
-        resetDate:           { type: Date, default: () => {
-            const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() + 1); return d;
-        }},
+        resetDate:           { type: Date, default: nextMonthResetDate },
     },
     // Per-user custom limits — when enabled, these override the plan defaults
     snovCustomLimits: {
         enabled:            { type: Boolean, default: false },
         leadsPerMonth:      { type: Number,  default: 0 },
         emailFindsPerMonth: { type: Number,  default: 0 },
+    },
+    // ─── AgencyAnalytics / Client Reporting ──────────────────────────────────
+    agencyAnalyticsPlan: {
+        type: String,
+        enum: ['none', 'starter', 'growth', 'agency'],
+        default: 'none',
+    },
+    agencyAnalyticsCreds: {
+        agencyUserId: { type: String, default: '' },
+        campaignId:   { type: String, default: '' },
+        accountId:    { type: String, default: '' },
+        loginUrl:     { type: String, default: 'https://app.agencyanalytics.com/login' },
+    },
+    agencyAnalyticsRequest: {
+        websiteUrl: { type: String, default: '' },
+        status:     { type: String, enum: ['none', 'pending', 'assigned'], default: 'none' },
+        submittedAt:{ type: Date, default: null },
+        updatedAt:  { type: Date, default: null },
+    },
+    agencyAnalyticsUsage: {
+        loginGrantsThisMonth:   { type: Number, default: 0 },
+        keywordReadsThisMonth:  { type: Number, default: 0 },
+        backlinkReadsThisMonth: { type: Number, default: 0 },
+        resetDate:              { type: Date, default: nextMonthResetDate },
+    },
+    agencyAnalyticsCustomLimits: {
+        enabled:                { type: Boolean, default: false },
+        loginGrantsPerMonth:    { type: Number, default: 0 },
+        keywordReadsPerMonth:   { type: Number, default: 0 },
+        backlinkReadsPerMonth:  { type: Number, default: 0 },
     },
     // ─── Stripe Subscription ─────────────────────────────────────────────────
     subscription: {

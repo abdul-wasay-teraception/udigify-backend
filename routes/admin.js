@@ -145,6 +145,106 @@ router.put('/users/:id/snov/reset-usage', protect, admin, async (req, res) => {
     }
 });
 
+// @desc    Update user AgencyAnalytics plan, mapping, and/or custom limits
+// @route   PUT /api/admin/users/:id/agencyanalytics
+// @access  Private/Admin
+router.put('/users/:id/agencyanalytics', protect, admin, async (req, res) => {
+    try {
+        const user = await User.findById(req.params.id);
+        if (!user) return res.status(404).json({ message: 'User not found' });
+
+        const nextPlan = req.body.agencyAnalyticsPlan !== undefined
+            ? req.body.agencyAnalyticsPlan
+            : user.agencyAnalyticsPlan;
+        const nextCreds = {
+            ...(user.agencyAnalyticsCreds || {}),
+            ...(req.body.agencyAnalyticsCreds || {}),
+        };
+
+        if (nextPlan && nextPlan !== 'none') {
+            if (!String(nextCreds.agencyUserId || '').trim()) {
+                return res.status(400).json({ message: 'AgencyAnalytics user ID is required when AgencyAnalytics access is enabled.' });
+            }
+            if (!String(nextCreds.campaignId || '').trim()) {
+                return res.status(400).json({ message: 'Campaign ID is required. Each user must be mapped to exactly one AgencyAnalytics website/campaign.' });
+            }
+        }
+
+        if (req.body.agencyAnalyticsPlan !== undefined) {
+            user.agencyAnalyticsPlan = req.body.agencyAnalyticsPlan;
+        }
+
+        if (req.body.agencyAnalyticsCreds) {
+            user.agencyAnalyticsCreds = {
+                ...(user.agencyAnalyticsCreds || {}),
+                ...req.body.agencyAnalyticsCreds,
+            };
+            user.markModified('agencyAnalyticsCreds');
+        }
+
+        if (String(nextCreds.campaignId || '').trim()) {
+            user.agencyAnalyticsRequest = {
+                ...(user.agencyAnalyticsRequest || {}),
+                status: 'assigned',
+                updatedAt: new Date(),
+            };
+            user.markModified('agencyAnalyticsRequest');
+        }
+
+        if (req.body.agencyAnalyticsCustomLimits !== undefined) {
+            user.agencyAnalyticsCustomLimits = {
+                ...(user.agencyAnalyticsCustomLimits || {}),
+                ...req.body.agencyAnalyticsCustomLimits,
+            };
+            user.markModified('agencyAnalyticsCustomLimits');
+        }
+
+        if (req.body.resetUsage) {
+            const nextReset = new Date();
+            nextReset.setDate(1);
+            nextReset.setMonth(nextReset.getMonth() + 1);
+            user.agencyAnalyticsUsage = {
+                loginGrantsThisMonth: 0,
+                keywordReadsThisMonth: 0,
+                backlinkReadsThisMonth: 0,
+                resetDate: nextReset,
+            };
+            user.markModified('agencyAnalyticsUsage');
+        }
+
+        const updated = await user.save();
+        res.json(updated);
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+});
+
+// @desc    Reset AgencyAnalytics usage counters for a user
+// @route   PUT /api/admin/users/:id/agencyanalytics/reset-usage
+// @access  Private/Admin
+router.put('/users/:id/agencyanalytics/reset-usage', protect, admin, async (req, res) => {
+    try {
+        const user = await User.findById(req.params.id);
+        if (!user) return res.status(404).json({ message: 'User not found' });
+
+        const nextReset = new Date();
+        nextReset.setDate(1);
+        nextReset.setMonth(nextReset.getMonth() + 1);
+        user.agencyAnalyticsUsage = {
+            loginGrantsThisMonth: 0,
+            keywordReadsThisMonth: 0,
+            backlinkReadsThisMonth: 0,
+            resetDate: nextReset,
+        };
+        user.markModified('agencyAnalyticsUsage');
+
+        const updated = await user.save();
+        res.json(updated);
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+});
+
 // @desc    Edit user (name, email, role, password)
 // @route   PUT /api/admin/users/:id
 // @access  Private/Admin
